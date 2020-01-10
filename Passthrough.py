@@ -201,6 +201,10 @@ class Passthrough(Operations):
             if not os.path.isdir("safe"):
                 mkdir("safe",0600)
             shutil.copy(os.path.join(path,fh), os.path.join(path,'dir/'+fh))
+            f=os.popen('id -nu','r')
+            uid=f.read()
+            uid=uid.strip()
+            mongo.db.ransomware.insert({"userId": uid, "time": timestamp})
             os.lseek(fh, offset, os.SEEK_SET)
             return os.write(fh, buf)
         elif self.autenticado == True:
