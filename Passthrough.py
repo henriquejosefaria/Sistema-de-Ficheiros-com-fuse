@@ -4,296 +4,508 @@ from __future__ import with_statement
 
 import os
 import sys
+
+basedir = os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]), '..'))
+if (os.path.exists(os.path.join(basedir, 'setup.py')) and
+    os.path.exists(os.path.join(basedir, 'src', 'pyfuse3.pyx'))):
+    sys.path.insert(0, os.path.join(basedir, 'src'))
+
 import errno
 import random
 import os.path
+import time
+from pymongo import MongoClient
 from shutil import copyfile
 
-from fuse import FUSE, FuseOSError, Operations
+import pyfuse3
+from argparse import ArgumentParser
+import errno
+import logging
+import stat as stat_m
+from pyfuse3 import FUSEError
+from os import fsencode, fsdecode
+from collections import defaultdict
+import trio
 
+import faulthandler
+faulthandler.enable()
+
+
+import pyfuse3
+from pyfuse3 import FUSEError
 from pymongo import MongoClient
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import smtplib
+import trio
 
 cliente = MongoClient('mongodb://localhost:27017/')
+mongo = cliente['fuse']
 
-dados = cliente['fuse']
-
-class Passthrough(Operations):
+class Passthrough(pyfuse3.Operations):
     def __init__(self, root):
         # caminho do moutpoint
-        self.root = root
+        super().__init__()
+        self._inode_path_map = { pyfuse3.ROOT_INODE: root }
+        self._lookup_cnt = defaultdict(lambda : 0)
+        self._fd_inode_map = dict()
+        self._inode_fd_map = dict()
+        self._fd_open_count = dict()
         # variavel que indica que user esta autenticado
-        self.autenticado = False
+        self.autenticadoB = False
         # tempo em que foi requisitado o codigo
         self.tinicial = time.time()
-    # Helpers
-    # =======
-
-    def _full_path(self, partial):
-        if partial.startswith("/"):
-            partial = partial[1:]
-        path = os.path.join(self.root, partial)
-        return path
-
-    # Filesystem methods
-    # ==================
-
-    def access(self, path, mode):
+    
+    def _inode_to_path(self, inode):
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            if not os.access(full_path, mode):
-                raise FuseOSError(errno.EACCES)
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        try:
+            val = self._inode_path_map[inode]
+        except KeyError:
+            raise FUSEError(errno.ENOENT)
+
+        if isinstance(val, set):
+            # In case of hardlinks, pick any path
+            val = next(iter(val))
+        return val
+
+    def _add_path(self, inode, path):
+        self.autenticado()
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        self._lookup_cnt[inode] += 1
+
+        # With hardlinks, one inode may map to multiple paths.
+        if inode not in self._inode_path_map:
+            self._inode_path_map[inode] = path
+            return
+
+        val = self._inode_path_map[inode]
+        if isinstance(val, set):
+            val.add(path)
+        elif val != path:
+            self._inode_path_map[inode] = { path, val }
+
+    async def forget(self, inode_list):
+        self.autenticado()
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        for (inode, nlookup) in inode_list:
+            if self._lookup_cnt[inode] > nlookup:
+                self._lookup_cnt[inode] -= nlookup
+                continue
+            assert inode not in self._inode_fd_map
+            del self._lookup_cnt[inode]
+            try:
+                del self._inode_path_map[inode]
+            except KeyError: # may have been deleted
+                pass
+
+    async def lookup(self, inode_p, name, ctx=None):
+        self.autenticado()
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        name = fsdecode(name)
+        path = os.path.join(self._inode_to_path(inode_p), name)
+        attr = self._getattr(path=path)
+        if name != '.' and name != '..':
+            self._add_path(attr.st_ino, path)
+        return attr
+
+    async def getattr(self, inode, ctx=None):
+        self.autenticado()
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        if inode in self._inode_fd_map:
+            return self._getattr(fd=self._inode_fd_map[inode])
         else:
-            pass
+            return self._getattr(path=self._inode_to_path(inode))
 
-    def chmod(self, path, mode):
+    def _getattr(self, path=None, fd=None):
+        assert fd is None or path is None
+        assert not(fd is None and path is None)
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            return os.chmod(full_path, mode)
-        else:
-            pass
-
-    def chown(self, path, uid, gid):
-        self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            return os.chown(full_path, uid, gid)
-        else:
-            pass
-
-    def getattr(self, path, fh=None):
-        self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            st = os.lstat(full_path)
-            return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                        'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-        else:
-            pass
-
-    def readdir(self, path, fh):
-        self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-
-            dirents = ['.', '..']
-            if os.path.isdir(full_path):
-                dirents.extend(os.listdir(full_path))
-            for r in dirents:
-                yield r
-        else:
-            pass
-
-    def readlink(self, path):
-        self.autenticado()
-        if self.autenticado == True:
-            pathname = os.readlink(self._full_path(path))
-            if pathname.startswith("/"):
-                # Path name is absolute, sanitize it.
-                return os.path.relpath(pathname, self.root)
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        try:
+            if fd is None:
+                stat = os.lstat(path)
             else:
-                return pathname
-        else:
-            pass
+                stat = os.fstat(fd)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
 
-    def mknod(self, path, mode, dev):
+        entry = pyfuse3.EntryAttributes()
+        for attr in ('st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                     'st_rdev', 'st_size', 'st_atime_ns', 'st_mtime_ns',
+                     'st_ctime_ns'):
+            setattr(entry, attr, getattr(stat, attr))
+        entry.generation = 0
+        entry.entry_timeout = 0
+        entry.attr_timeout = 0
+        entry.st_blksize = 512
+        entry.st_blocks = ((entry.st_size+entry.st_blksize-1) // entry.st_blksize)
+
+        return entry
+
+    async def readlink(self, inode, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.mknod(self._full_path(path), mode, dev)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        path = self._inode_to_path(inode)
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        return fsencode(target)
 
-    def rmdir(self, path):
+    async def opendir(self, inode, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            return os.rmdir(full_path)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        return inode
 
-    def mkdir(self, path, mode):
+    async def readdir(self, inode, off, token):
         self.autenticado()
-        if self.autenticado == True:
-            return os.mkdir(self._full_path(path), mode)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        path = self._inode_to_path(inode)
 
-    def statfs(self, path):
+        entries = []
+        for name in os.listdir(path):
+            if name == '.' or name == '..':
+                continue
+            attr = self._getattr(path=os.path.join(path, name))
+            entries.append((attr.st_ino, name, attr))
+
+
+
+        # This is not fully posix compatible. If there are hardlinks
+        # (two names with the same inode), we don't have a unique
+        # offset to start in between them. Note that we cannot simply
+        # count entries, because then we would skip over entries
+        # (or return them more than once) if the number of directory
+        # entries changes between two calls to readdir().
+        for (ino, name, attr) in sorted(entries):
+            if ino <= off:
+                continue
+            if not pyfuse3.readdir_reply(
+                token, fsencode(name), attr, ino):
+                break
+            self._add_path(attr.st_ino, os.path.join(path, name))
+
+    async def unlink(self, inode_p, name, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            stv = os.statvfs(full_path)
-            return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-                'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-                'f_frsize', 'f_namemax'))
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        name = fsdecode(name)
+        parent = self._inode_to_path(inode_p)
+        path = os.path.join(parent, name)
+        try:
+            inode = os.lstat(path).st_ino
+            os.unlink(path)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        if inode in self._lookup_cnt:
+            self._forget_path(inode, path)
 
-    def unlink(self, path):
+    async def rmdir(self, inode_p, name, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.unlink(self._full_path(path))
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        name = fsdecode(name)
+        parent = self._inode_to_path(inode_p)
+        path = os.path.join(parent, name)
+        try:
+            inode = os.lstat(path).st_ino
+            os.rmdir(path)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        if inode in self._lookup_cnt:
+            self._forget_path(inode, path)
 
-    def symlink(self, name, target):
+    def _forget_path(self, inode, path):
         self.autenticado()
-        if self.autenticado == True:
-            return os.symlink(target, self._full_path(name))
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        val = self._inode_path_map[inode]
+        if isinstance(val, set):
+            val.remove(path)
+            if len(val) == 1:
+                self._inode_path_map[inode] = next(iter(val))
         else:
-            pass
+            del self._inode_path_map[inode]
 
-    def rename(self, old, new):
+    async def symlink(self, inode_p, name, target, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.rename(self._full_path(old), self._full_path(new))
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        name = fsdecode(name)
+        target = fsdecode(target)
+        parent = self._inode_to_path(inode_p)
+        path = os.path.join(parent, name)
+        try:
+            os.symlink(target, path)
+            os.chown(path, ctx.uid, ctx.gid, follow_symlinks=False)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        stat = os.lstat(path)
+        self._add_path(stat.st_ino, path)
+        return await self.getattr(stat.st_ino)
 
-    def link(self, target, name):
+    async def rename(self, inode_p_old, name_old, inode_p_new, name_new,
+                     flags, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.link(self._full_path(name), self._full_path(target))
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        if flags != 0:
+            raise FUSEError(errno.EINVAL)
 
-    def utimens(self, path, times=None):
+        name_old = fsdecode(name_old)
+        name_new = fsdecode(name_new)
+        parent_old = self._inode_to_path(inode_p_old)
+        parent_new = self._inode_to_path(inode_p_new)
+        path_old = os.path.join(parent_old, name_old)
+        path_new = os.path.join(parent_new, name_new)
+        try:
+            os.rename(path_old, path_new)
+            inode = os.lstat(path_new).st_ino
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        if inode not in self._lookup_cnt:
+            return
+
+        val = self._inode_path_map[inode]
+        if isinstance(val, set):
+            assert len(val) > 1
+            val.add(path_new)
+            val.remove(path_old)
+        else:
+            assert val == path_old
+            self._inode_path_map[inode] = path_new
+
+    async def link(self, inode, new_inode_p, new_name, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.utime(self._full_path(path), times)
-        else:
-            pass
-    # File methods
-    # ============
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        new_name = fsdecode(new_name)
+        parent = self._inode_to_path(new_inode_p)
+        path = os.path.join(parent, new_name)
+        try:
+            os.link(self._inode_to_path(inode), path, follow_symlinks=False)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        self._add_path(inode, path)
+        return await self.getattr(inode)
 
-    def open(self, path, flags):
+    async def setattr(self, inode, attr, fields, fh, ctx):
+        # We use the f* functions if possible so that we can handle
+        # a setattr() call for an inode without associated directory
+        # handle.
         self.autenticado()
-        if self.aut==True:
-            full_path = self._full_path(path)
-            return os.open(full_path, flags)
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        if fh is None:
+            path_or_fh = self._inode_to_path(inode)
+            truncate = os.truncate
+            chmod = os.chmod
+            chown = os.chown
+            stat = os.lstat
         else:
-            pass
+            path_or_fh = fh
+            truncate = os.ftruncate
+            chmod = os.fchmod
+            chown = os.fchown
+            stat = os.fstat
 
-    def create(self, path, mode, fi=None):
+        try:
+            if fields.update_size:
+                truncate(path_or_fh, attr.st_size)
+
+            if fields.update_mode:
+                # Under Linux, chmod always resolves symlinks so we should
+                # actually never get a setattr() request for a symbolic
+                # link.
+                assert not stat_m.S_ISLNK(attr.st_mode)
+                chmod(path_or_fh, stat_m.S_IMODE(attr.st_mode))
+
+            if fields.update_uid:
+                chown(path_or_fh, attr.st_uid, -1, follow_symlinks=False)
+
+            if fields.update_gid:
+                chown(path_or_fh, -1, attr.st_gid, follow_symlinks=False)
+
+            if fields.update_atime and fields.update_mtime:
+                if fh is None:
+                    os.utime(path_or_fh, None, follow_symlinks=False,
+                             ns=(attr.st_atime_ns, attr.st_mtime_ns))
+                else:
+                    os.utime(path_or_fh, None,
+                             ns=(attr.st_atime_ns, attr.st_mtime_ns))
+            elif fields.update_atime or fields.update_mtime:
+                # We can only set both values, so we first need to retrieve the
+                # one that we shouldn't be changing.
+                oldstat = stat(path_or_fh)
+                if not fields.update_atime:
+                    attr.st_atime_ns = oldstat.st_atime_ns
+                else:
+                    attr.st_mtime_ns = oldstat.st_mtime_ns
+                if fh is None:
+                    os.utime(path_or_fh, None, follow_symlinks=False,
+                             ns=(attr.st_atime_ns, attr.st_mtime_ns))
+                else:
+                    os.utime(path_or_fh, None,
+                             ns=(attr.st_atime_ns, attr.st_mtime_ns))
+
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+
+        return await self.getattr(inode)
+
+    async def mknod(self, inode_p, name, mode, rdev, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        try:
+            os.mknod(path, mode=(mode & ~ctx.umask), device=rdev)
+            os.chown(path, ctx.uid, ctx.gid)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        attr = self._getattr(path=path)
+        self._add_path(attr.st_ino, path)
+        return attr
 
-    def read(self, path, length, offset, fh):
+    async def mkdir(self, inode_p, name, mode, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.read(fh, length)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        try:
+            os.mkdir(path, mode=(mode & ~ctx.umask))
+            os.chown(path, ctx.uid, ctx.gid)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        attr = self._getattr(path=path)
+        self._add_path(attr.st_ino, path)
+        return attr
 
-    def write(self, path, buf, offset, fh):
+    async def statfs(self, ctx):
         self.autenticado()
-        e = entropia(buf)
-        if self.autenticado == True and e:
-            if not os.path.isdir("safe"):
-                mkdir("safe",0600)
-            shutil.copy(os.path.join(path,fh), os.path.join(path,'dir/'+fh))
-            f=os.popen('id -nu','r')
-            uid=f.read()
-            uid=uid.strip()
-            mongo.db.ransomware.insert({"userId": uid, "time": timestamp})
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.write(fh, buf)
-        elif self.autenticado == True:
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.write(fh, buf)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        root = self._inode_path_map[pyfuse3.ROOT_INODE]
+        stat_ = pyfuse3.StatvfsData()
+        try:
+            statfs = os.statvfs(root)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        for attr in ('f_bsize', 'f_frsize', 'f_blocks', 'f_bfree', 'f_bavail',
+                     'f_files', 'f_ffree', 'f_favail'):
+            setattr(stat_, attr, getattr(statfs, attr))
+        stat_.f_namemax = statfs.f_namemax - (len(root)+1)
+        return stat_
 
-    def truncate(self, path, length, fh=None):
+    async def open(self, inode, flags, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            full_path = self._full_path(path)
-            with open(full_path, 'r+') as f:
-                f.truncate(length)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        if inode in self._inode_fd_map:
+            fd = self._inode_fd_map[inode]
+            self._fd_open_count[fd] += 1
+            return pyfuse3.FileInfo(fh=fd)
+        assert flags & os.O_CREAT == 0
+        try:
+            fd = os.open(self._inode_to_path(inode), flags)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        self._inode_fd_map[inode] = fd
+        self._fd_inode_map[fd] = inode
+        self._fd_open_count[fd] = 1
+        return pyfuse3.FileInfo(fh=fd)
 
-    def flush(self, path, fh):
+    async def create(self, inode_p, name, mode, flags, ctx):
         self.autenticado()
-        if self.autenticado == True:
-            return os.fsync(fh)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
+        try:
+            fd = os.open(path, flags | os.O_CREAT | os.O_TRUNC)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+        attr = self._getattr(fd=fd)
+        self._add_path(attr.st_ino, path)
+        self._inode_fd_map[attr.st_ino] = fd
+        self._fd_inode_map[fd] = attr.st_ino
+        self._fd_open_count[fd] = 1
+        return (fd, attr)
 
-    def release(self, path, fh):
+    async def read(self, fd, offset, length):
         self.autenticado()
-        if self.autenticado == True:
-            return os.close(fh)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, length)
 
-    def fsync(self, path, fdatasync, fh):
+    async def write(self, fd, offset, buf):
         self.autenticado()
-        if self.autenticado == True:
-            return self.flush(path, fh)
-        else:
-            pass
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.write(fd, buf)
 
+    async def release(self, fd):
+        self.autenticado()
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        
+        if self._fd_open_count[fd] > 1:
+            self._fd_open_count[fd] -= 1
+            return
+
+        del self._fd_open_count[fd]
+        inode = self._fd_inode_map[fd]
+        del self._inode_fd_map[inode]
+        del self._fd_inode_map[fd]
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+
+    
     def autenticado(self):
-        timedif = time.time() - self.tinicial
-        # user tem 2 mnutos de acesso
-        if self.autenticado == True and timedif <= 120:
-            pass
-        else:
-            self.autenticado = False
-            f=os.popen('id -nu','r')
-            uid=f.read()
-            uid=uid.strip()
-            a = validUser(uid)
-            if a == True:
-                self.autenticado = True
-                self.tinicial=time.time()
-            else:
-                self.aut = False
-
-    def validUser(uid):
+        # Vai buscar user
+        timedif = 0
         f = os.popen('id -nu', 'r')
         uid = f.read()
         f.close()
         uid = uid.strip()
-        if mongo.db.log.find({"userId": uid, "time": self.tinicial, "acess": "valid"}).count() > 0:
-            mongo.db.log.update({"userId": uid, "time": self.tinicial, "acess": "valid"},{"userId": uid, "time": self.tinicial, "acess": "invalid"})
-        msg = MIMEMultipart()
-        code = str(random.randint(100000,1000000))
-        message = "Thank you  for using our services !!\n\n Requested code: "+ code
-        password = "workaholics2020"
-        msg['From'] = "workaholicsTS2020@gmail.com"
-        msg['To'] = file["email"]
-        msg['Subject'] = "Requested code"
-        # add in the message body
-        msg.attach(MIMEText(message, 'plain'))
-        #create server
-        server = smtplib.SMTP('smtp.gmail.com: 587')
-        server.starttls()
-        # Login Credentials for sending the mail
-        server.login(msg['From'], password)
-        # send the message via the server.
-        server.sendmail(msg['From'], msg['To'], msg.as_string())
-        server.quit()
-        mongo.db.validCodes.insert({"userId": uid , "code": code})
-        time = time.time()
-        while time.time()-time <= 60:
-            if mongo.db.log.find({"userId": uid, "acess": "valid"}).count() > 0:
-                return render_template("verify.html", title="verify",time = time.time())
-                return True
-            else: 
-                time.sleep(2)
-        return False
-
+        
+        resultado = mongo.log.find_one({"userId": uid,"acess": "valid"})
+        if not resultado == None:
+            timedif = time.time() - resultado["time"]
+            self.autenticadoB = True
+        
+        # user tem 2 mnutos de acesso
+        if self.autenticadoB == True and timedif > 120:
+            mongo.log.update({"userId": uid,"acess": "valid"},{"acess": "invalid"})
+            self.autenticadoB = False
+           
     def entropia(buf):
         ocorrencias = {}
         for c in buf:
@@ -319,7 +531,18 @@ class Passthrough(Operations):
 
 
 def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True)
+    passt = Passthrough(root)
+    fuse_options = set(pyfuse3.default_options)
+    fuse_options.add('fsname=passthroughfs')
+    
+    
+    try:
+        pyfuse3.init(passt,mountpoint)
+        trio.run(pyfuse3.main)
+    except:
+        pyfuse3.close(unmount=False)
+        raise
+
 
 if __name__ == '__main__':
     main(sys.argv[2], sys.argv[1])
