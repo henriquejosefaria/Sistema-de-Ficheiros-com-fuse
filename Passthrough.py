@@ -57,9 +57,6 @@ class Passthrough(pyfuse3.Operations):
         self.tinicial = time.time()
     
     def _inode_to_path(self, inode):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         
         try:
             val = self._inode_path_map[inode]
@@ -72,9 +69,6 @@ class Passthrough(pyfuse3.Operations):
         return val
 
     def _add_path(self, inode, path):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         self._lookup_cnt[inode] += 1
 
         # With hardlinks, one inode may map to multiple paths.
@@ -89,9 +83,6 @@ class Passthrough(pyfuse3.Operations):
             self._inode_path_map[inode] = { path, val }
 
     async def forget(self, inode_list):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         for (inode, nlookup) in inode_list:
             if self._lookup_cnt[inode] > nlookup:
                 self._lookup_cnt[inode] -= nlookup
@@ -104,7 +95,7 @@ class Passthrough(pyfuse3.Operations):
                 pass
 
     async def lookup(self, inode_p, name, ctx=None):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         name = fsdecode(name)
@@ -115,7 +106,7 @@ class Passthrough(pyfuse3.Operations):
         return attr
 
     async def getattr(self, inode, ctx=None):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         if inode in self._inode_fd_map:
@@ -126,9 +117,6 @@ class Passthrough(pyfuse3.Operations):
     def _getattr(self, path=None, fd=None):
         assert fd is None or path is None
         assert not(fd is None and path is None)
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         try:
             if fd is None:
                 stat = os.lstat(path)
@@ -151,7 +139,7 @@ class Passthrough(pyfuse3.Operations):
         return entry
 
     async def readlink(self, inode, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         path = self._inode_to_path(inode)
@@ -162,15 +150,12 @@ class Passthrough(pyfuse3.Operations):
         return fsencode(target)
 
     async def opendir(self, inode, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         return inode
 
     async def readdir(self, inode, off, token):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         path = self._inode_to_path(inode)
 
         entries = []
@@ -197,7 +182,7 @@ class Passthrough(pyfuse3.Operations):
             self._add_path(attr.st_ino, os.path.join(path, name))
 
     async def unlink(self, inode_p, name, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -213,7 +198,7 @@ class Passthrough(pyfuse3.Operations):
             self._forget_path(inode, path)
 
     async def rmdir(self, inode_p, name, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -229,9 +214,6 @@ class Passthrough(pyfuse3.Operations):
             self._forget_path(inode, path)
 
     def _forget_path(self, inode, path):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         val = self._inode_path_map[inode]
         if isinstance(val, set):
             val.remove(path)
@@ -241,7 +223,7 @@ class Passthrough(pyfuse3.Operations):
             del self._inode_path_map[inode]
 
     async def symlink(self, inode_p, name, target, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -260,7 +242,7 @@ class Passthrough(pyfuse3.Operations):
 
     async def rename(self, inode_p_old, name_old, inode_p_new, name_new,
                      flags, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -291,7 +273,7 @@ class Passthrough(pyfuse3.Operations):
             self._inode_path_map[inode] = path_new
 
     async def link(self, inode, new_inode_p, new_name, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -309,7 +291,7 @@ class Passthrough(pyfuse3.Operations):
         # We use the f* functions if possible so that we can handle
         # a setattr() call for an inode without associated directory
         # handle.
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -371,7 +353,7 @@ class Passthrough(pyfuse3.Operations):
         return await self.getattr(inode)
 
     async def mknod(self, inode_p, name, mode, rdev, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -386,7 +368,7 @@ class Passthrough(pyfuse3.Operations):
         return attr
 
     async def mkdir(self, inode_p, name, mode, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -401,7 +383,7 @@ class Passthrough(pyfuse3.Operations):
         return attr
 
     async def statfs(self, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -418,7 +400,7 @@ class Passthrough(pyfuse3.Operations):
         return stat_
 
     async def open(self, inode, flags, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -437,7 +419,7 @@ class Passthrough(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=fd)
 
     async def create(self, inode_p, name, mode, flags, ctx):
-        self.autenticado()
+        self.autenticado(ctx)
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -454,26 +436,16 @@ class Passthrough(pyfuse3.Operations):
         return (fd, attr)
 
     async def read(self, fd, offset, length):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         
         os.lseek(fd, offset, os.SEEK_SET)
         return os.read(fd, length)
 
     async def write(self, fd, offset, buf):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
         
         os.lseek(fd, offset, os.SEEK_SET)
         return os.write(fd, buf)
 
     async def release(self, fd):
-        self.autenticado()
-        if not self.autenticadoB:
-            raise FUSEError(1)
-        
         if self._fd_open_count[fd] > 1:
             self._fd_open_count[fd] -= 1
             return
@@ -488,22 +460,18 @@ class Passthrough(pyfuse3.Operations):
             raise FUSEError(exc.errno)
 
     
-    def autenticado(self):
+    def autenticado(self,ctx):
         # Vai buscar user
         timedif = 0
-        f = os.popen('id -nu', 'r')
-        uid = f.read()
-        f.close()
-        uid = uid.strip()
-        
-        resultado = mongo.log.find_one({"userId": uid,"acess": "valid"})
+        print(str(ctx.uid))
+        resultado = mongo.log.find_one({"userId": str(ctx.uid),"acess": "valid"})
         if not resultado == None:
             timedif = time.time() - resultado["time"]
             self.autenticadoB = True
         
         # user tem 2 mnutos de acesso
         if self.autenticadoB == True and timedif > 120:
-            mongo.log.update({"userId": uid,"acess": "valid"},{"acess": "invalid"})
+            mongo.log.update({"userId": str(ctx.uid),"acess": "valid"},{"userId": str(ctx.uid),"time": resultado["time"],"acess": "invalid"})
             self.autenticadoB = False
            
     def entropia(buf):

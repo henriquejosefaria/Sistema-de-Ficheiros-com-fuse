@@ -25,19 +25,19 @@ def Server():
 def acess():
 	global user_id
 	if request.method == 'POST': 		
-		email = request.form['email']
+		user_id = request.form['email']
 		# verifca se email é válido e user tem permissão para entrar
-		if mongo.db.users.find({"email": email}).count() > 0:
+		if mongo.db.users.find({"userId": user_id}).count() > 0:
 			# encontra dados do utilizador
-			file = mongo.db.users.find_one({"email":email})
-			user_id = file["userId"]
+			file = mongo.db.users.find_one({"userId":user_id})
+			email = file["email"]
 			# prepara e envia email com código secreto
 			msg = MIMEMultipart()
 			code = str(random.randint(100000,1000000))
 			message = "Thank you  for using our services !!\n\n Requested code: "+ code
 			password = "workaholics2020"
 			msg['From'] = "workaholicsTS2020@gmail.com"
-			msg['To'] = file["email"]
+			msg['To'] = email
 			msg['Subject'] = "Requested code"
 			# add in the message body
 			msg.attach(MIMEText(message, 'plain'))
@@ -49,7 +49,7 @@ def acess():
 			# send the message via the server.
 			server.sendmail(msg['From'], msg['To'], msg.as_string())
 			server.quit()
-			mongo.db.validCodes.insert({"userId": file["userId"] , "code": code})
+			mongo.db.validCodes.insert({"userId": user_id , "code": code})
 			return render_template("verify.html", title="verify",time = time.time())
 		else:
 			flash("Email inserido está errado!!", "fail")
