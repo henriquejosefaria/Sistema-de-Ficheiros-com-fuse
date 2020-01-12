@@ -508,7 +508,7 @@ class Passthrough(pyfuse3.Operations):
         length = len(buf)
         # calcula probabilidade de cada elemento distinto
         for c in ocorrencias:
-            prob.append(c/length)
+            prob.append(ocorrencias[c]/length)
             length2 = len(ocorrencias)
             randomelements = 0
         probmedia = 1/len(buf)
