@@ -55,6 +55,7 @@ class Passthrough(pyfuse3.Operations):
         self.autenticadoB = False
         # tempo em que foi requisitado o codigo
         self.tinicial = time.time()
+        self.safenumber = 0
     
     def _inode_to_path(self, inode):
         
@@ -436,12 +437,34 @@ class Passthrough(pyfuse3.Operations):
         return (fd, attr)
 
     async def read(self, fd, offset, length):
-        
+        self.autenticado(ctx)
+        if not self.autenticadoB:
+            raise FUSEError(1)
         os.lseek(fd, offset, os.SEEK_SET)
         return os.read(fd, length)
 
-    async def write(self, fd, offset, buf):
-        
+    async def write(self, fd, offset, buf, ctx):
+        self.autenticado(ctx)
+        if not self.autenticadoB:
+            raise FUSEError(1)
+        #se 92% dos elementos inseridos estiverem com uma presença similar á probabilidade média
+        # de todos os elementos é copiado o ficheiro por segrança
+        if entropia(buf):
+            try:
+                #cria diretoria com permissões de leitura apenas
+                if not os.path.isdir("safe"):
+                    os.mkdir("safe")
+                    os.system("chmod 0200 safe")
+            except:
+                print("directory exists!!")
+            path = os.path.dirname(os.path.realpath(fd))
+            filename, file_extension = os.path.splitext(fd)
+            #copia para o diretório safe
+            shutil.copy(path+"/"+fd,path+'/safe/')
+            #renomeia o ficheiro guardado para precaver vários ataques diferentes
+            os.system("sudo mv safe/"+fd+ " " + "safe/" +fd + str(self.safenumber)+file_extension)
+            self.safenumber += 1
+            mongo.db.ransomware.insert({"userId": ctx, "time": timestamp})
         os.lseek(fd, offset, os.SEEK_SET)
         return os.write(fd, buf)
 
@@ -488,9 +511,10 @@ class Passthrough(pyfuse3.Operations):
             prob.append(c/length)
             length2 = len(ocorrencias)
             randomelements = 0
+        probmedia = 1/len(buf)
         # Caso 92% dos elementos ou mais tenham uma distribuicao entre  48% e 52% assume-se que e um elemento usado para cifrar
         for p in prob:
-            if b > 0.48  and b < 0.52:
+            if p > (probmedia -0.02) and p < (probmedia + 0.02):
                 randomelements += 1
         if randomelements/length2 > 0.92:
             return True
