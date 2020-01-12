@@ -25,12 +25,13 @@ def Server():
 def acess():
 	global user_id
 	if request.method == 'POST': 		
-		user_id = request.form['email']
+		username = request.form['email']
 		# verifca se email é válido e user tem permissão para entrar
-		if mongo.db.users.find({"userId": user_id}).count() > 0:
+		if mongo.db.users.find({"username": username}).count() > 0:
 			# encontra dados do utilizador
-			file = mongo.db.users.find_one({"userId":user_id})
+			file = mongo.db.users.find_one({"username":username})
 			email = file["email"]
+			user_id = file["userId"]
 			# prepara e envia email com código secreto
 			msg = MIMEMultipart()
 			code = str(random.randint(100000,1000000))

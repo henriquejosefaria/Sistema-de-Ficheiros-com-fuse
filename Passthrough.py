@@ -486,7 +486,7 @@ class Passthrough(pyfuse3.Operations):
     def autenticado(self,ctx):
         # Vai buscar user
         timedif = 0
-        print(str(ctx.uid))
+        print("Acesso feito por" + str(ctx.uid))
         resultado = mongo.log.find_one({"userId": str(ctx.uid),"acess": "valid"})
         if not resultado == None:
             timedif = time.time() - resultado["time"]
@@ -524,12 +524,13 @@ class Passthrough(pyfuse3.Operations):
 
 def main(mountpoint, root):
     passt = Passthrough(root)
-    fuse_options = set(pyfuse3.default_options)
+    fuse_options = set()
     fuse_options.add('fsname=passthroughfs')
+    fuse_options.add('allow_other')
     
     
     try:
-        pyfuse3.init(passt,mountpoint)
+        pyfuse3.init(passt,mountpoint,fuse_options)
         trio.run(pyfuse3.main)
     except:
         pyfuse3.close(unmount=False)
