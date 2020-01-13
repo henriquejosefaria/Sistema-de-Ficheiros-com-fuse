@@ -15,8 +15,8 @@ import random
 import os.path
 import time
 from pymongo import MongoClient
-from shutil import copyfile
-
+import shutil
+import pyclamd
 import pyfuse3
 from argparse import ArgumentParser
 import errno
@@ -26,6 +26,7 @@ from pyfuse3 import FUSEError
 from os import fsencode, fsdecode
 from collections import defaultdict
 import trio
+import codecs
 
 import faulthandler
 faulthandler.enable()
@@ -56,6 +57,8 @@ class Passthrough(pyfuse3.Operations):
         # tempo em que foi requisitado o codigo
         self.tinicial = time.time()
         self.safenumber = 0
+        self.lastContextt = None
+        self.clamav = pyclamd.ClamdAgnostic()
     
     def _inode_to_path(self, inode):
         
@@ -97,6 +100,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def lookup(self, inode_p, name, ctx=None):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         name = fsdecode(name)
@@ -107,7 +112,11 @@ class Passthrough(pyfuse3.Operations):
         return attr
 
     async def getattr(self, inode, ctx=None):
+        if ctx == None:
+            raise FUSEError(1)
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         if inode in self._inode_fd_map:
@@ -141,6 +150,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def readlink(self, inode, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         path = self._inode_to_path(inode)
@@ -152,6 +163,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def opendir(self, inode, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         return inode
@@ -184,6 +197,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def unlink(self, inode_p, name, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -200,6 +215,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def rmdir(self, inode_p, name, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -225,6 +242,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def symlink(self, inode_p, name, target, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -239,11 +258,13 @@ class Passthrough(pyfuse3.Operations):
             raise FUSEError(exc.errno)
         stat = os.lstat(path)
         self._add_path(stat.st_ino, path)
-        return await self.getattr(stat.st_ino)
+        return await self.getattr(stat.st_ino,ctx)
 
     async def rename(self, inode_p_old, name_old, inode_p_new, name_new,
                      flags, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -275,6 +296,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def link(self, inode, new_inode_p, new_name, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -286,13 +309,15 @@ class Passthrough(pyfuse3.Operations):
         except OSError as exc:
             raise FUSEError(exc.errno)
         self._add_path(inode, path)
-        return await self.getattr(inode)
+        return await self.getattr(inode,ctx)
 
     async def setattr(self, inode, attr, fields, fh, ctx):
         # We use the f* functions if possible so that we can handle
         # a setattr() call for an inode without associated directory
         # handle.
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -351,10 +376,12 @@ class Passthrough(pyfuse3.Operations):
         except OSError as exc:
             raise FUSEError(exc.errno)
 
-        return await self.getattr(inode)
+        return await self.getattr(inode,ctx)
 
     async def mknod(self, inode_p, name, mode, rdev, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -370,6 +397,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def mkdir(self, inode_p, name, mode, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -385,6 +414,8 @@ class Passthrough(pyfuse3.Operations):
 
     async def statfs(self, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
@@ -402,16 +433,28 @@ class Passthrough(pyfuse3.Operations):
 
     async def open(self, inode, flags, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
+        
         if not self.autenticadoB:
             raise FUSEError(1)
         
+        fdt = os.open(self._inode_to_path(inode), os.O_RDONLY)
+        os.lseek(fdt, 0, 0) 
+        buffe = os.read(fdt,os.stat(self._inode_to_path(inode)).st_size)
+        self.backupFile = buffe
+        os.close(fdt)
+        
         if inode in self._inode_fd_map:
+            print("AKI")
             fd = self._inode_fd_map[inode]
+            print("Foi buscar o File descriptor " +  str(fd) )
             self._fd_open_count[fd] += 1
             return pyfuse3.FileInfo(fh=fd)
         assert flags & os.O_CREAT == 0
+        
         try:
             fd = os.open(self._inode_to_path(inode), flags)
+            print("Abriu o file descriptor " + str(fd))
         except OSError as exc:
             raise FUSEError(exc.errno)
         self._inode_fd_map[inode] = fd
@@ -421,12 +464,15 @@ class Passthrough(pyfuse3.Operations):
 
     async def create(self, inode_p, name, mode, flags, ctx):
         self.autenticado(ctx)
+        self.lastContextt = ctx
         if not self.autenticadoB:
             raise FUSEError(1)
         
         path = os.path.join(self._inode_to_path(inode_p), fsdecode(name))
         try:
             fd = os.open(path, flags | os.O_CREAT | os.O_TRUNC)
+            print("Criou o ficheiro " + str(fd))
+            os.read(fd,1)
         except OSError as exc:
             raise FUSEError(exc.errno)
         attr = self._getattr(fd=fd)
@@ -437,40 +483,67 @@ class Passthrough(pyfuse3.Operations):
         return (fd, attr)
 
     async def read(self, fd, offset, length):
-        self.autenticado(ctx)
-        if not self.autenticadoB:
-            raise FUSEError(1)
         os.lseek(fd, offset, os.SEEK_SET)
         return os.read(fd, length)
 
-    async def write(self, fd, offset, buf, ctx):
-        self.autenticado(ctx)
-        if not self.autenticadoB:
-            raise FUSEError(1)
+    async def write(self, fd, offset, buf):
         #se 92% dos elementos inseridos estiverem com uma presença similar á probabilidade média
         # de todos os elementos é copiado o ficheiro por segrança
-        if entropia(buf):
+        inodel = self._fd_inode_map[fd]
+        path = self._inode_to_path(inodel)
+        print("Caminho -> " + path)
+        print(buf)
+        virus = self.clamav.scan_stream((codecs.getdecoder("unicode_escape")(buf)[0]).encode("utf-8"))
+        print(virus)
+        if not virus is None:
+            print("Encontrou Virus")
+            mongo.virus.insert({"userId": self.lastContextt.uid, "time": time.time(), "virus": virus })
+            return os.write(fd,self.backupFile)
+        
+        if not self.entropia(buf):
+            
+            
+            
+            names = path.split("/")
+            dirpath = ""
+            for i in range(1,len(names)-1):
+            	dirpath = dirpath + "/" + names[i]
+            if len(names) > 1:
+            	dirpath = dirpath + "/"
             try:
                 #cria diretoria com permissões de leitura apenas
-                if not os.path.isdir("safe"):
+                if not os.path.isdir("/safe"):
                     os.mkdir("safe")
-                    os.system("chmod 0200 safe")
+                    print("Created Safe")
             except:
                 print("directory exists!!")
-            path = os.path.dirname(os.path.realpath(fd))
-            filename, file_extension = os.path.splitext(fd)
+            file_path = names[len(names)-1]
             #copia para o diretório safe
-            shutil.copy(path+"/"+fd,path+'/safe/')
+            if not os.path.isdir("safe/" + dirpath):
+            	os.system("mkdir -p " + "safe/"+ dirpath)
+            
             #renomeia o ficheiro guardado para precaver vários ataques diferentes
-            os.system("sudo mv safe/"+fd+ " " + "safe/" +fd + str(self.safenumber)+file_extension)
+            
+            try:
+                file_d = os.open("safe/" + dirpath + str(self.safenumber)+ file_path,os.O_WRONLY | os.O_TRUNC | os.O_CREAT)
+                os.lseek(file_d,0,0)
+                os.write(file_d,self.backupFile)
+                os.close(file_d)
+            	#shutil.copyfile(path,"safe/" + dirpath + str(self.safenumber)+ file_path,follow_symlinks=True)
+            	#os.system("cp " + path + " " + names[0] + "/" + "safe/" + dirpath + str(self.safenumber)+ file_path)
+                os.system("chmod 0200 " +"safe/" + dirpath + str(self.safenumber)+ file_path)
+            except :
+                print("Deu Exception")
             self.safenumber += 1
-            mongo.db.ransomware.insert({"userId": ctx, "time": timestamp})
+            mongo.ransomware.insert({"userId": self.lastContextt.uid, "time": time.time()})
         os.lseek(fd, offset, os.SEEK_SET)
         return os.write(fd, buf)
 
     async def release(self, fd):
+        print("Entrei no Release")
         if self._fd_open_count[fd] > 1:
             self._fd_open_count[fd] -= 1
+            print("decrementou 1")
             return
 
         del self._fd_open_count[fd]
@@ -479,6 +552,7 @@ class Passthrough(pyfuse3.Operations):
         del self._fd_inode_map[fd]
         try:
             os.close(fd)
+            print("fechou " + str(fd)) 
         except OSError as exc:
             raise FUSEError(exc.errno)
 
@@ -486,18 +560,18 @@ class Passthrough(pyfuse3.Operations):
     def autenticado(self,ctx):
         # Vai buscar user
         timedif = 0
-        print("Acesso feito por" + str(ctx.uid))
+        #print("Acesso feito por" + str(ctx.uid))
         resultado = mongo.log.find_one({"userId": str(ctx.uid),"acess": "valid"})
         if not resultado == None:
             timedif = time.time() - resultado["time"]
             self.autenticadoB = True
         
         # user tem 2 mnutos de acesso
-        if self.autenticadoB == True and timedif > 120:
+        if self.autenticadoB == True and timedif > 120000000:
             mongo.log.update({"userId": str(ctx.uid),"acess": "valid"},{"userId": str(ctx.uid),"time": resultado["time"],"acess": "invalid"})
             self.autenticadoB = False
            
-    def entropia(buf):
+    def entropia(self,buf):
         ocorrencias = {}
         for c in buf:
             if c in ocorrencias:
