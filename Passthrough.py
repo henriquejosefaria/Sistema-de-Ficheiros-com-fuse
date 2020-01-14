@@ -585,7 +585,7 @@ class Passthrough(pyfuse3.Operations):
             prob.append(ocorrencias[c]/length)
             length2 = len(ocorrencias)
             randomelements = 0
-        probmedia = 1/len(buf)
+        probmedia = 1/len(ocorrencias)
         # Caso 92% dos elementos ou mais tenham uma distribuicao entre  48% e 52% assume-se que e um elemento usado para cifrar
         for p in prob:
             if p > (probmedia -0.02) and p < (probmedia + 0.02):
